@@ -10,19 +10,44 @@ from __future__ import absolute_import, division, print_function
 __author__ = "Aaron Fienberg"
 
 import json
+import os
 import time
 import sys
 
 import numpy as np
+import numba
 import tensorflow as tf
 import zmq
 
+FREEDOM_DIR = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
+if FREEDOM_DIR not in sys.path:
+    sys.path.append(FREEDOM_DIR)
+from freeDOM.transformations import chargenet_trafo, hitnet_trafo
+import llh_cython
 import eval_llh
 
 
 def wstdout(s):
     sys.stdout.write(s)
     sys.stdout.flush()
+
+
+# fake eval_llh for development
+zero_floats = np.full(10000, 10, np.float32)
+
+
+class fake_llh:
+    def __init__(self):
+        pass
+
+    def numpy(self):
+        return zero_floats
+
+
+def fake_eval_llh(*args, **kwargs):
+    return fake_llh()
 
 
 class LLHService:
@@ -55,14 +80,18 @@ class LLHService:
         poll_timeout,
         flush_period,
         model_file,
-        n_features,
+        n_hypo_params,
+        n_obs_features,
         batch_size,
-        transform_params,
         send_hwm,
         recv_hwm,
+        transform_params=None,
+        use_freeDOM_model=False,
+        hitnet_file=None,
+        chargenet_file=None,
+        router_mandatory=False,
+        bypass_tensorflow=False,
     ):
-        self._eval_llh = eval_llh.eval_llh
-
         self._work_reqs = []
 
         self._n_table_rows = batch_size["n_observations"]
@@ -70,10 +99,8 @@ class LLHService:
         self._n_hypos = batch_size["n_hypos"]
         """number of hypotheses per batch"""
 
-        # note: my example has one "observation" feature,
-        # This should be made more general
-        self._n_obs_features = 1
-        self._n_hypo_params = n_features - self._n_obs_features
+        self._n_obs_features = n_obs_features
+        self._n_hypo_params = n_hypo_params
 
         self._x_table = np.zeros(
             (self._n_table_rows, self._n_obs_features), dtype=np.float32
@@ -87,10 +114,26 @@ class LLHService:
         self._next_table_ind = 0
         self._next_hypo_ind = 0
 
-        classifier = tf.keras.models.load_model(model_file)
+        if not use_freeDOM_model:
+            classifier = tf.keras.models.load_model(model_file)
 
-        # build a model that includes the normalization
-        self._model = eval_llh.build_norm_model(classifier, **transform_params)
+            # build a model that includes the normalization
+            self._model = eval_llh.build_norm_model(classifier, **transform_params)
+
+            self._eval_llh = eval_llh.eval_llh
+        else:
+            hitnet = tf.keras.models.load_model(
+                hitnet_file, custom_objects={"hitnet_trafo": hitnet_trafo}
+            )
+            chargenet = tf.keras.models.load_model(
+                chargenet_file, custom_objects={"chargenet_trafo": chargenet_trafo}
+            )
+            self._model = (hitnet, chargenet)
+
+            self._eval_llh = eval_llh.freedom_nllh
+
+        if bypass_tensorflow:
+            self._eval_llh = fake_eval_llh
 
         # trace-compile the llh function in advance
         self._eval_llh(
@@ -111,11 +154,35 @@ class LLHService:
         self._last_flush = 0
 
         self._init_sockets(
-            req_addr=req_addr, ctrl_addr=ctrl_addr, send_hwm=send_hwm, recv_hwm=recv_hwm
+            req_addr=req_addr,
+            ctrl_addr=ctrl_addr,
+            send_hwm=send_hwm,
+            recv_hwm=recv_hwm,
+            router_mandatory=router_mandatory,
         )
 
+        # trace-compile the llh function in advance
+        self._eval_llh(
+            tf.constant(self._x_table),
+            tf.constant(self._theta_table),
+            tf.constant(self._stop_inds),
+            self._model,
+        )
+
+        # # jit compile self._fill_tables
+        # self._fill_tables(
+        #     self._x_table,
+        #     self._theta_table,
+        #     self._stop_inds,
+        #     np.zeros(self._n_obs_features, np.float32),
+        #     np.zeros(self._n_hypo_params, np.float32),
+        #     0,
+        #     0,
+        # )
+        # self._flush()
+
+    # @profile
     def start_work_loop(self):
-        wstdout("starting work loop\n")
         flush_period = self._flush_period
         self._last_flush = time.time()
 
@@ -141,13 +208,15 @@ class LLHService:
             if time.time() - self._last_flush > flush_period:
                 self._flush()
 
-    def _init_sockets(self, req_addr, ctrl_addr, send_hwm, recv_hwm):
+    def _init_sockets(self, req_addr, ctrl_addr, send_hwm, recv_hwm, router_mandatory):
         # pylint: disable=no-member
-        self._ctxt = zmq.Context.instance()
+        self._ctxt = zmq.Context()
 
         req_sock = self._ctxt.socket(zmq.ROUTER)
         req_sock.setsockopt(zmq.SNDHWM, send_hwm)
         req_sock.setsockopt(zmq.RCVHWM, recv_hwm)
+        if router_mandatory:
+            req_sock.setsockopt(zmq.ROUTER_MANDATORY, 1)
         req_sock.bind(req_addr)
 
         ctrl_sock = self._ctxt.socket(zmq.PULL)
@@ -164,7 +233,7 @@ class LLHService:
         self._ctxt.destroy()
 
     def _process_message(self, msg_parts):
-        wstdout(".")
+        # wstdout(".")
         header_frames = msg_parts[:-2]
         x, theta = msg_parts[-2:]
 
@@ -196,10 +265,20 @@ class LLHService:
             stop_ind = n_rows
             stop_hypo_ind = batch_size
 
-        # fill table with observations and hypothesis parameters
-        self._x_table[next_ind:stop_ind] = np.tile(
-            x, (batch_size, self._n_obs_features)
+        self._record_req(
+            x, thetas, next_ind, hypo_ind, stop_ind, stop_hypo_ind, header_frames
         )
+        # self._numba_record_req(x, thetas, next_ind, hypo_ind, header_frames)
+
+    # @profile
+    def _record_req(
+        self, x, thetas, next_ind, hypo_ind, stop_ind, stop_hypo_ind, header_frames
+    ):
+        batch_size = len(thetas)
+        n_obs = len(x)
+
+        # fill table with observations and hypothesis parameters
+        self._x_table[next_ind:stop_ind] = np.tile(x, (batch_size, 1))
         self._theta_table[hypo_ind:stop_hypo_ind] = thetas
 
         # update stop indices
@@ -217,11 +296,57 @@ class LLHService:
         self._next_table_ind = stop_ind
         self._next_hypo_ind = stop_hypo_ind
 
+    # @profile
+    def _numba_record_req(self, x, thetas, next_ind, hypo_ind, header_frames):
+        self._fill_tables(
+            self._x_table,
+            self._theta_table,
+            self._stop_inds,
+            x,
+            thetas,
+            next_ind,
+            hypo_ind,
+        )
+
+        stop_hypo_ind = hypo_ind + len(thetas)
+
+        # record work request information
+        work_item_dict = dict(
+            header_frames=header_frames, start_ind=hypo_ind, stop_ind=stop_hypo_ind,
+        )
+        self._work_reqs.append(work_item_dict)
+        self._next_table_ind = next_ind + len(x) * len(thetas)
+        self._next_hypo_ind = stop_hypo_ind
+
+    @staticmethod
+    @numba.njit
+    def _fill_tables(x_table, theta_table, stop_inds, x, thetas, next_ind, hypo_ind):
+
+        batch_size = len(thetas)
+        n_obs = len(x)
+
+        # fill table with observations and hypothesis parameters
+        for i in range(batch_size):
+            start = next_ind + i * n_obs
+            stop = start + n_obs
+            x_table[start:stop] = x
+
+        theta_table[hypo_ind : hypo_ind + batch_size] = thetas
+
+        # update stop indices
+        next_stop = next_ind + n_obs
+        stop_inds[hypo_ind : hypo_ind + batch_size] = np.arange(
+            next_stop, next_stop + n_obs * batch_size, n_obs
+        )
+
+    # @profile
     def _process_all_reqs(self):
         # pylint: disable=no-member
         while True:
             try:
-                self._process_message(self._req_sock.recv_multipart(zmq.NOBLOCK))
+                # frames = self._req_sock.recv_multipart(zmq.DONTWAIT)
+                frames = llh_cython.receive_req(self._req_sock)
+                self._process_message(frames)
             except zmq.error.Again:
                 # no more messages
                 return
@@ -235,7 +360,7 @@ class LLHService:
         """
         # pylint: disable=no-member
         try:
-            return self._ctrl_sock.recv_string(zmq.NOBLOCK)
+            return self._ctrl_sock.recv_string(zmq.DONTWAIT)
         except zmq.error.Again:
             # this should never happen, we are receiving only after polling.
             # print a message and raise again
@@ -247,24 +372,30 @@ class LLHService:
 
     def _flush(self):
         self._last_flush = time.time()
-        wstdout("F")
+        # wstdout("F")
 
         if self._work_reqs:
-            wstdout("+")
+            # wstdout("+")
             x_table = tf.constant(self._x_table)
             theta_table = tf.constant(self._theta_table)
             stop_inds = tf.constant(self._stop_inds)
             llh_sums = self._eval_llh(x_table, theta_table, stop_inds, self._model)
             llhs = llh_sums.numpy()
 
-            for work_req in self._work_reqs:
-                llh_slice = llhs[work_req["start_ind"] : work_req["stop_ind"]]
-                self._req_sock.send_multipart(work_req["header_frames"] + [llh_slice])
+            # self._dispatch_replies(llhs)
+            llh_cython.dispatch_replies(self._req_sock, self._work_reqs, llhs)
 
             self._work_reqs.clear()
             self._next_table_ind = 0
             self._next_hypo_ind = 0
             self._stop_inds[:] = self._n_table_rows
+
+    # @profile
+    def _dispatch_replies(self, llhs):
+        for work_req in self._work_reqs:
+            llh_slice = llhs[work_req["start_ind"] : work_req["stop_ind"]]
+            frames = work_req["header_frames"] + [llh_slice]
+            self._req_sock.send_multipart(frames)
 
 
 def main():
@@ -272,6 +403,7 @@ def main():
         params = json.load(f)
 
     with LLHService(**params) as service:
+        wstdout("starting work loop:\n")
         service.start_work_loop()
 
 
